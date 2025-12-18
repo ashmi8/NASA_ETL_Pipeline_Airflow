@@ -1,0 +1,92 @@
+from airflow import DAG
+from airflow.providers.http.operators.http import HttpOperator
+from airflow.decorators import task
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+import pendulum
+import json
+
+
+## Define the DAG
+with DAG(
+    dag_id= 'nasa_apod_etl',
+    start_date= pendulum.now('UTC').subtract(days=1),
+    schedule= '@daily',
+    catchup= False,
+
+) as dag:
+    
+    ## Step 1: Create the table if it doesn't exist
+    @task
+    def create_table():
+        ## Intialize Postgres hook
+        postgres_hook = PostgresHook(postgres_conn_id='postgres_default')
+
+        ## Create SQL table query
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS apod_data (
+            id SERIAL PRIMARY KEY,
+            title VARCHAR(255),
+            explanation TEXT,
+            url TEXT,
+            date DATE,
+            media_type VARCHAR(50)
+        );"""
+
+        ## Execute the create table query
+        postgres_hook.run(create_table_query)
+
+    ## Step 2: Extract the NASA API Data(APOD)-Astronomy Picture of the Day[Extract pipeline]
+    ## Sample API url: https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY
+    extract_apod_data = HttpOperator(
+        task_id='extract_apod_data',
+        http_conn_id='nasa_api',## Connection ID created in Airflow UI
+        endpoint='planetary/apod',## API endpoint
+        method='GET',
+        data= {'api_key': "{{conn.nasa_api.extra_dejson.api_key}}" },## API key from connection extra field
+        response_filter=lambda response: response.json(), ## Parse JSON response
+        response_check=lambda response: response.status_code == 200, ## Check for successful response
+    )
+
+    ## Step 3: Transform the data 
+    @task
+    def transform_apod_data(response):
+        apod_data={
+            'title': response.get('title',''),
+            'explanation': response.get('explanation',''),
+            'url': response.get('url',''),
+            'date': response.get('date',''),
+            'media_type': response.get('media_type','')
+        }
+        return apod_data
+    
+    ## Step 4: Load the data into Postgres [Load pipeline]
+    @task
+    def load_data_to_postgres(apod_data):
+        ## Initialize Postgres hook
+        postgres_hook = PostgresHook(postgres_conn_id='postgres_default')
+
+        ## Insert data into Postgres table
+        insert_query = """
+        INSERT INTO apod_data (title, explanation, url, date, media_type)
+        VALUES (%s, %s, %s, %s, %s);
+        """
+        ## Execute the insert query
+        postgres_hook.run(insert_query, parameters=(
+            apod_data['title'],
+            apod_data['explanation'],
+            apod_data['url'],
+            apod_data['date'],
+            apod_data['media_type']
+        ))
+        
+    ## Step 5: Verify the data load by querying the Postgres table
+    
+    ## Step 6: Define task dependencies  
+    create_table() >> extract_apod_data ## Ensure table is created before extraction
+    api_response = extract_apod_data.output
+    ## Transform 
+    transformed_data = transform_apod_data(api_response)
+    ## Load
+    load_data_to_postgres_task= load_data_to_postgres(transformed_data)
+
+
